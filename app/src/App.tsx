@@ -27,6 +27,7 @@ import { createLatestOnly } from "./latestOnly";
 import { createNoticeFlusher } from "./noticeFlusher";
 import { heldCount, type Queues } from "./noticeQueue";
 import { aggregateTeamStatus, applyStateChange, type PaneStatusMap, type RawState } from "./agentStatus";
+import { agentPaneRows, diffAgentStatus, type AgentPaneRow } from "./addonStatus";
 import { AUTO_TIMEZONE, formatMessageTime, isValidTimeZone, resolveTimeZone } from "./time";
 import {
   AgentModal,
@@ -94,6 +95,8 @@ export type Pane = {
   native: boolean;
   /** The journal entry of an agent an add-on started: the backend learns the process from it. */
   agentKey?: string;
+  /** The agent type (claude-code, codex, ...) of a pane that runs a member's CLI. Not set on a shell, an add-on pane or the bash fallback. */
+  agentType?: string;
   /** A free login shell (the "+" tab, or a tab's "Open shell" context menu
    *  item) — unattached to any agent. Drives the sidebar-click "spawn beside
    *  the shell instead of a new tab" behavior below: it has to be an
@@ -977,6 +980,22 @@ export default function App() {
     setPaneStatus((current) => applyStateChange(current, paneId, state));
   }, []);
 
+  // Tell the host when an agent pane appears, changes state or goes away, so it can tell the add-ons that read its team.
+  // One call per actual change (the diff is empty otherwise); no polling and no timer.
+  const [endedPanes, setEndedPanes] = useState<ReadonlySet<string>>(() => new Set());
+  const statusSentRef = useRef<ReadonlyMap<string, AgentPaneRow>>(new Map());
+  useEffect(() => {
+    const rows = agentPaneRows(
+      windows.map((w) => ({ team: w.team, leafIds: leaves(w.root) })),
+      panes,
+      paneStatus,
+      endedPanes,
+    );
+    const { reports, next } = diffAgentStatus(statusSentRef.current, rows, Date.now());
+    statusSentRef.current = next;
+    for (const r of reports) void invoke("addon_agent_status", r).catch(() => {});
+  }, [windows, panes, paneStatus, endedPanes]);
+
   // Cell size in CSS px. The ref is for snapping a divider drag to whole
   // terminal rows/cols — read once at drag-start, doesn't need a re-render
   // on every fit. The state twin drives the gap BETWEEN panes below (it
@@ -1473,6 +1492,7 @@ export default function App() {
             cwd: m.project || undefined,
             native: monitors,
             agentKey: fromAddon?.key,
+            agentType: type,
           }
         : { id, label: m.name, cmd: "bash", args: [], cwd: m.project || undefined, native: false };
       setPanes((prev) => [...prev, pane]);
@@ -1542,6 +1562,7 @@ export default function App() {
 
   useEffect(() => {
     const p = listen<{ id: string }>("pty-exit", (e) => {
+      setEndedPanes((current) => (current.has(e.payload.id) ? current : new Set(current).add(e.payload.id)));
       setPaneStatus((current) => {
         if (!(e.payload.id in current)) return current;
         const next = { ...current };
